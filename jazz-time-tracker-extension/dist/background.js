@@ -10,11 +10,13 @@
 // Firefox lists core.js in the manifest instead.
 if (typeof importScripts === "function" && !globalThis.JTT) importScripts("core.js");
 
-const { DEFAULT_SETTINGS, computeDayStatus, todayKey, resolveLanguage, translate } = globalThis.JTT;
+const { DEFAULT_SETTINGS, SETTING_KEYS, computeDayStatus, todayKey, resolveLanguage, translate, readBackup } = globalThis.JTT;
 
 const ALARM_SOON = "jtt-go-home-soon";
 const ALARM_NOW = "jtt-go-home-now";
 const ALARM_ICON = "jtt-icon";
+const ALARM_BREAK = "jtt-break-done";
+const ALARM_BACKUP = "jtt-auto-backup";
 const ICON = chrome.runtime.getURL("icon128.png");
 
 function showNotification(id, title, message) {
@@ -125,11 +127,98 @@ function updateIcon() {
 
 function startIconTimer() {
   chrome.alarms.create(ALARM_ICON, { periodInMinutes: 1 });
+  chrome.alarms.create(ALARM_BACKUP, { delayInMinutes: 1, periodInMinutes: 360 });
   updateIcon();
 }
 
+// ------------------------------------------------------------------ backup
+
+const BACKUP_EVERY_DAYS = 30;
+
+/**
+ * Once a month the data is saved as a file to Downloads/Jazz Time Tracker.
+ * The first run only notes the date, so installing does not drop a file right away.
+ */
+function autoBackup() {
+  chrome.storage.local.get({ autoBackup: true, jttLastBackup: null, language: "auto" }, (items) => {
+    if (!items.autoBackup) return;
+    const now = Date.now();
+    if (!items.jttLastBackup) {
+      chrome.storage.local.set({ jttLastBackup: now });
+      return;
+    }
+    if (now - items.jttLastBackup < BACKUP_EVERY_DAYS * 86400000) return;
+    readBackup((json) => {
+      // Service workers have no blob URLs; a data URL works for files of this size.
+      const url =
+        typeof URL.createObjectURL === "function" && typeof Blob === "function" && typeof document !== "undefined"
+          ? URL.createObjectURL(new Blob([json], { type: "application/json" }))
+          : `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
+      chrome.downloads.download(
+        { url, filename: `Jazz Time Tracker/jazz-time-tracker-${todayKey()}.json`, conflictAction: "uniquify", saveAs: false },
+        (id) => {
+          if (chrome.runtime.lastError || id === undefined) return;
+          chrome.storage.local.set({ jttLastBackup: now });
+          const lang = resolveLanguage(items.language);
+          showNotification(ALARM_BACKUP, translate(lang, "autoBackupDoneTitle"), translate(lang, "autoBackupDoneBody"));
+        },
+      );
+    });
+  });
+}
+
+// -------------------------------------------------------------------- sync
+
+/**
+ * Settings and plans are mirrored to chrome.storage.sync, so every browser signed in to the
+ * same account gets them. Local storage stays the place everything reads from.
+ * jttSyncAt says which side is newer; it is only written here, which also tells our own
+ * writes apart from the user's changes.
+ */
+const SYNC_KEYS = [...SETTING_KEYS.filter((key) => key !== "syncSettings"), "jttPlan"];
+let syncTimer = null;
+
+function pushToSync() {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => {
+    chrome.storage.local.get({ ...DEFAULT_SETTINGS, jttPlan: null }, (items) => {
+      if (items.syncSettings === false) return;
+      const now = Date.now();
+      const data = { jttSyncAt: now };
+      for (const key of SYNC_KEYS) if (items[key] !== null && items[key] !== undefined) data[key] = items[key];
+      chrome.storage.sync.set(data, () => {
+        if (chrome.runtime.lastError) return; // sync off or quota: local keeps working
+        chrome.storage.local.set({ jttSyncAt: now });
+      });
+    });
+  }, 1500);
+}
+
+function pullFromSync() {
+  chrome.storage.local.get({ syncSettings: true, jttSyncAt: 0 }, (local) => {
+    if (local.syncSettings === false) return;
+    chrome.storage.sync.get(null, (remote) => {
+      if (chrome.runtime.lastError || !remote || !remote.jttSyncAt || remote.jttSyncAt <= local.jttSyncAt) return;
+      const data = { jttSyncAt: remote.jttSyncAt };
+      for (const key of SYNC_KEYS) if (key in remote) data[key] = remote[key];
+      chrome.storage.local.set(data);
+    });
+  });
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync") {
+    if (changes.jttSyncAt) pullFromSync();
+    return;
+  }
+  if (area !== "local" || changes.jttSyncAt) return; // our own write
+  if (SYNC_KEYS.some((key) => key in changes) || changes.syncSettings) pushToSync();
+});
+
 chrome.runtime.onInstalled.addListener(startIconTimer);
 chrome.runtime.onStartup.addListener(startIconTimer);
+chrome.runtime.onStartup.addListener(pullFromSync);
+chrome.runtime.onInstalled.addListener(pullFromSync);
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.liveStatus || changes.dailyHours || changes.language)) updateIcon();
 });
@@ -149,6 +238,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
   } else if (message.type === "jtt-clear") {
     clearAlarms();
+  } else if (message.type === "jtt-break") {
+    chrome.alarms.clear(ALARM_BREAK);
+    chrome.storage.local.set({ jttBreakTexts: message.texts }, () => {
+      if (message.at > Date.now()) chrome.alarms.create(ALARM_BREAK, { when: message.at });
+    });
+  } else if (message.type === "jtt-break-clear") {
+    chrome.alarms.clear(ALARM_BREAK);
   } else if (message.type === "jtt-notify") {
     showNotification(message.id, message.title, message.message);
   }
@@ -160,11 +256,44 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     updateIcon();
     return;
   }
+  if (alarm.name === ALARM_BACKUP) {
+    autoBackup();
+    return;
+  }
+  if (alarm.name === ALARM_BREAK) {
+    chrome.storage.local.get({ jttBreakTexts: null, notifyEnabled: true }, (items) => {
+      if (items.jttBreakTexts && items.notifyEnabled) {
+        showNotification(ALARM_BREAK, items.jttBreakTexts.title, items.jttBreakTexts.body);
+      }
+    });
+    return;
+  }
   if (alarm.name !== ALARM_SOON && alarm.name !== ALARM_NOW) return;
   chrome.storage.local.get({ jttAlarmTexts: null, notifyEnabled: true }, (items) => {
     const texts = items.jttAlarmTexts;
     if (!texts || !items.notifyEnabled) return;
     if (alarm.name === ALARM_SOON) showNotification(ALARM_SOON, texts.soonTitle, texts.soonBody);
     else showNotification(ALARM_NOW, texts.nowTitle, texts.nowBody);
+  });
+});
+
+// ---------------------------------------------------------------- shortcut
+
+/** Alt+J (Option+J on Mac): switch to the Jazz stamp page, or open it. */
+const JAZZ_FALLBACK_URL = "https://jazz.coop.ch/mobile/";
+
+chrome.commands.onCommand.addListener((command) => {
+  if (command !== "open-jazz") return;
+  chrome.storage.local.get({ jttStampUrl: JAZZ_FALLBACK_URL }, (items) => {
+    const patterns = chrome.runtime.getManifest().host_permissions; // the Jazz pages this extension may see
+    chrome.tabs.query({ url: patterns }, (tabs) => {
+      const tab = (tabs || []).find((t) => (t.url || "").includes("stempel")) || (tabs || [])[0];
+      if (tab) {
+        chrome.tabs.update(tab.id, { active: true });
+        chrome.windows.update(tab.windowId, { focused: true });
+      } else {
+        chrome.tabs.create({ url: items.jttStampUrl });
+      }
+    });
   });
 });

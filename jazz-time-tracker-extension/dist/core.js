@@ -22,6 +22,9 @@
     notifyLeadMinutes: 10,
     language: "auto",
     theme: "light",
+    autoBackup: true,
+    syncSettings: true,
+    dailySchool: { monday: false, tuesday: false, wednesday: false, thursday: false, friday: false },
     dailyHours: {
       monday: { hours: 8, minutes: 12 },
       tuesday: { hours: 8, minutes: 12 },
@@ -588,6 +591,136 @@
     return base + status.timeSpent.totalMinutes - status.target.totalMinutes;
   }
 
+  /**
+   * Go-home time if the day's break is `breakMinutes` long and starts at `startMinutes`.
+   * Breaks already taken today count towards it, and the required minimum break still applies.
+   */
+  function plannedGoHome(status, startMinutes, breakMinutes) {
+    const now = new Time().totalMinutes;
+    const taken = status.breaks.totalMinutes;
+    const stillToWork = status.target.totalMinutes - status.timeSpent.totalMinutes;
+    const wanted = Math.max(0, breakMinutes - taken);
+    const required = Math.max(0, status.minimumBreak.totalMinutes - taken);
+    const remaining = Math.max(wanted, required);
+    return {
+      goHome: new Time(now + Math.max(0, stillToWork) + remaining),
+      breakEnd: new Time(Math.max(startMinutes, now) + remaining),
+      remaining,
+      added: remaining - wanted,
+    };
+  }
+
+  /**
+   * Extra minutes per working day (Mon-Fri) needed to bring the time balance from `base`
+   * to `goal` by `untilKey` ("YYYY-MM-DD"). Today counts unless Jazz's balance already includes it.
+   * Public holidays are not known and count as working days.
+   */
+  function goalPerDay(base, goal, untilKey, asOf, status, school = {}) {
+    const isWorkday = (day) => day.getDay() !== 0 && day.getDay() !== 6 && !school[WEEKDAY_KEYS[day.getDay()]];
+    const now = new Date();
+    const todayStr = `${String(now.getDate()).padStart(2, "0")}.${String(now.getMonth() + 1).padStart(2, "0")}.${now.getFullYear()}`;
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (asOf === todayStr ? 1 : 0));
+    const [y, m, d] = untilKey.split("-").map(Number);
+    const end = new Date(y, m - 1, d);
+    let days = 0;
+    for (const day = new Date(start); day <= end; day.setDate(day.getDate() + 1)) {
+      if (isWorkday(day)) days++;
+    }
+    if (days === 0) return { days, perDay: 0, todayGoHome: null };
+    const perDay = Math.ceil((goal - base) / days);
+    const todayCounts = asOf !== todayStr && isWorkday(now);
+    return {
+      days,
+      perDay,
+      todayGoHome: todayCounts && perDay > 0 ? new Time(status.goHomeTime.totalMinutes + perDay) : null,
+    };
+  }
+
+  const WEEKDAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+  /** School days only exist for apprentices; for everyone else none of them count. */
+  function schoolDays(settings) {
+    return settings.isApprentice && settings.dailySchool ? settings.dailySchool : {};
+  }
+
+  /** True if today is marked as a school day in the settings. */
+  function isSchoolToday(settings, date = new Date()) {
+    return Boolean(schoolDays(settings)[WEEKDAY_KEYS[date.getDay()]]);
+  }
+
+  /**
+   * When to take the next break. Rule: at most 5:30 of work without a 15-minute break.
+   * - latest: the current stretch of work reaches 5:30
+   * - earliest: early enough is pointless if more than 5:30 of work would still follow,
+   *   because then another break would be needed before going home
+   * Null when clocked out. `needed: false` when the rest of the day fits without a break.
+   */
+  function breakWindow(status, checkpoints) {
+    if (!status.clockedIn) return null;
+    const limit = 330;
+    const now = new Time().totalMinutes;
+    const cps = new TimeCalculator(new Time(0), new Time(0)).getExtendedCheckpoints(checkpoints);
+    const blocks = continuousBlocks(cps, Time.of(0, 15));
+    const stretch = blocks.length ? blocks[blocks.length - 1].duration.totalMinutes : 0;
+    const stillToWork = Math.max(0, status.target.totalMinutes - status.timeSpent.totalMinutes);
+    if (stretch + stillToWork <= limit) return { needed: false };
+    const earliest = now + Math.max(0, stillToWork - limit);
+    const latest = now + Math.max(0, limit - stretch);
+    return { needed: true, earliest: new Time(earliest), latest: new Time(latest), twoBreaks: earliest > latest };
+  }
+
+  /**
+   * The saved balance goal for today, or null when it cannot be worked out.
+   * `plan` holds goal ("+1:00") and goalDate ("YYYY-MM-DD", empty = end of this month).
+   */
+  function goalToday(plan, balances, status, school = {}) {
+    if (!plan || !balances || !balances.time) return null;
+    const base = parseSignedTime(balances.time.value);
+    const goal = parseSignedTime(plan.goal || "");
+    if (base === null || goal === null) return null;
+    let until = plan.goalDate;
+    if (!until) {
+      const now = new Date();
+      const end = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      until = `${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, "0")}-${String(end.getDate()).padStart(2, "0")}`;
+    }
+    return { goal, until, ...goalPerDay(base, goal, until, balances.time.asOf, status, school) };
+  }
+
+  /** One line for the status block and the popup: "Für dein Ziel heute +0:50 · Feierabend 18:42". */
+  function describeGoalToday(result, lang) {
+    if (!result) return null;
+    if (result.days === 0) return { text: translate(lang, "goalLineOver"), kind: "muted" };
+    if (result.perDay <= 0) return { text: translate(lang, "goalLineReached"), kind: "ok" };
+    const value = formatSigned(result.perDay);
+    return result.todayGoHome
+      ? { text: translate(lang, "goalLine", { value, time: result.todayGoHome.toString() }), kind: "todo" }
+      : { text: translate(lang, "goalLineNoToday", { value }), kind: "todo" };
+  }
+
+  // ------------------------------------------------------------------ backup
+
+  /** Stored data that goes into a backup besides the settings. */
+  const BACKUP_KEYS = ["jttPlan", "jttOpen", "jttSaldoHistory", "jttDays"];
+
+  /** Reads everything for a backup and hands back the file content. */
+  function readBackup(callback) {
+    const keys = { ...DEFAULT_SETTINGS };
+    for (const key of BACKUP_KEYS) keys[key] = null;
+    chrome.storage.local.get(keys, (items) => {
+      const data = {
+        app: "jazz-time-tracker",
+        version: chrome.runtime.getManifest().version,
+        exported: new Date().toISOString(),
+        data: items,
+      };
+      callback(JSON.stringify(data, null, 2), items);
+    });
+  }
+
+  /** What's new per version: number of lines (texts are new_<version>_<i>). */
+  const WHATS_NEW = { "2.1.0": 6 };
+
   /** Short text for the toolbar icon: time to go, or the overtime once the target is passed. */
   function badgeText(status) {
     const toGo = status.timeToGo.totalMinutes;
@@ -623,6 +756,10 @@
       dayShort_wednesday: "We",
       dayShort_thursday: "Th",
       dayShort_friday: "Fr",
+      dayShort_saturday: "Sa",
+      dayShort_sunday: "Su",
+      saturday: "Saturday",
+      sunday: "Sunday",
       breakRunning: "On break since {since} \u00b7 {current}",
       breakLeft: "{time} left until {n} min of break",
       breakDone: "{n} min of break reached",
@@ -630,7 +767,123 @@
       whatIfAfter: "",
       whatIfBalance: "Time balance then {value}",
       autoSaved: "Saved",
-      toolWhatIf: "If I leave at \u2026",
+      school: "School",
+      toolHistory: "History",
+      toolMore: "More",
+      whatsNewTitle: "New in version {version}",
+      whatsNewOk: "Got it",
+      syncSettings: "Sync settings",
+      syncSettingsDesc: "Target hours, school days, goal and plan via your browser account (Chrome sync).",
+      new_2_1_0_0: "The status block in the look of Jazz, with progress bar, balances and break times",
+      new_2_1_0_1: "More menu: plan, week, history chart, records and balance goal",
+      new_2_1_0_2: "Toolbar icon with today's percentage, and Alt+J for the stamp page",
+      new_2_1_0_3: "Notifications before going home and when a break is complete",
+      new_2_1_0_4: "German / English, dark mode, school days for apprentices",
+      new_2_1_0_5: "Automatic monthly backup and settings synced across your browsers",
+      toolHelp: "Help",
+      helpTitle: "What is what",
+      help_status_term: "Status",
+      help_status_text: "Clocked in or out, time spent, time to go (negative = overtime) and when you can go home.",
+      help_bar_term: "Bar",
+      help_bar_text: "Green = work, blue = absence booked in Jazz (e.g. an appointment), orange = overtime. Below: break and overtime.",
+      help_breaks_term: "Breaks",
+      help_breaks_text: "While clocked in: from when a break makes sense and when it is due at the latest. While clocked out: the running break.",
+      help_clockout_term: "CLOCK OUT!!!",
+      help_clockout_text: "Appears in red while a break rule is being broken right now.",
+      help_balances_term: "Balances",
+      help_balances_text: "Time and vacation balance from the bottom of the Jazz page, plus the time balance including today.",
+      help_menu_term: "More (•••)",
+      help_menu_text: "Plan (leave at …, lunch break), week overview, history with chart, records and balance goal.",
+      help_top_term: "DE / EN and moon",
+      help_top_text: "Language of the extension and the Jazz page, and dark mode for the whole page.",
+      help_icon_term: "Toolbar icon",
+      help_icon_text: "Ring with the percentage of today; hover for the times. Alt+J (Option+J) opens the stamp page.",
+      help_popup_term: "Popup",
+      help_popup_text: "Click the icon: live status, settings (target hours, school days, notifications) and backups.",
+      toolRecords: "Records",
+      recordsTitle: "Records ({n} days)",
+      recordsTitleEmpty: "Records appear once a few working days are known",
+      recEarliest: "Earliest start",
+      recLongest: "Longest day",
+      recStreak: "Without break violation",
+      recDay: "1 day",
+      recDays: "{n} days",
+      recBest: "record {n}",
+      dayChartTitle: "Today vs. normal",
+      rangeLabel: "Normal from",
+      range_three: "3 days",
+      range_week: "Week",
+      range_month: "Month",
+      range_max: "Max",
+      dayToday: "Today",
+      dayNormal: "Normal",
+      dayModel: "Typical day",
+      dayAhead: "{value} ahead",
+      dayBehind: "{value} behind",
+      dayEven: "same as usual",
+      dayNormalNote: "Normal = average of your last {n} working days.",
+      dayModelNote: "No past days known yet, so the normal line assumes 8:00 start and a 30 min break at 12:00.",
+      goalLine: "Balance goal: today {value} \u00b7 until {time}",
+      goalLineNoToday: "Balance goal: {value} per working day",
+      goalLineReached: "Balance goal reached",
+      goalOn: "Balance goal on, shown every day",
+      goalOff: "Balance goal off",
+      goalLineOver: "The date of your balance goal has passed",
+      historyTitle: "Balance history",
+      historyChange: "since {from}: {value}",
+      historyEmpty: "Recording starts today: one point is added for every day you open the stamp page.",
+      historyFew: "More points are added each day you open the stamp page.",
+      backupTitle: "Back up data",
+      backupText: "Settings, plans and the balance history as a file, e.g. for another computer.",
+      backupExport: "Export",
+      backupImport: "Import",
+      backupImported: "Imported",
+      backupInvalid: "This is not a Jazz Time Tracker backup.",
+      autoBackup: "Back up automatically every month",
+      autoBackupDesc: "Saved to Downloads \u2192 Jazz Time Tracker.",
+      lastBackup: "Last backup: {date}",
+      noBackupYet: "No backup yet",
+      autoBackupDoneTitle: "Backup saved",
+      autoBackupDoneBody: "Your Jazz Time Tracker data is in Downloads \u2192 Jazz Time Tracker.",
+      breakWindow: "Best break time: from {from}, at the latest {to}",
+      breakWindowNow: "Take a break by {to} at the latest",
+      breakWindowTwo: "Two breaks needed today, the first by {to}",
+      breakWindowNone: "No further break needed today",
+      schoolShort: "School",
+      schoolToday: "School day today",
+      schoolTodayNote: "No work time planned. Stamps still count if you work part of the day.",
+      schoolToggle: "{day} is a school day",
+      schoolHint: "School days do not count in the week total or the balance goal.",
+      toolWhatIf: "Plan",
+      toolGoal: "Balance goal",
+      goalTitle: "Balance goal",
+      planTitle: "Plan",
+      lunchBefore: "Break at",
+      lunchMiddle: "for",
+      lunchAfter: "min",
+      lunchResult: "Home at {time}",
+      lunchAtLabel: "Break starts at",
+      lunchMinLabel: "Break length in minutes",
+      lunchNote: "Break until {end}",
+      lunchDone: "Break already taken today",
+      lunchNoteTopped: "Break until {end}, topped up to the {n} min minimum break",
+      lunchOnlyClockedIn: "Works while you are clocked in",
+      goalBefore: "Time balance",
+      goalMiddle: "by",
+      goalLabel: "Target time balance",
+      goalDateLabel: "Target date",
+      goalPerDay: "{value} per day",
+      goalReached: "Goal reached",
+      goalReachedNote: "With {days} working days left you could even work {value} less per day",
+      goalNote: "{days} working days left \u00b7 today until {time}",
+      goalNoteNoToday: "{days} working days left",
+      goalNoDays: "No working day left until that date",
+      goalNoBalance: "No time balance found on the page",
+      breakDoneTitle: "Break done",
+      breakDoneBody: "Your {n} minutes of break are complete. You can clock in again.",
+      tabToGo: "{time} to go",
+      tabOvertime: "+{time} overtime",
+      tabBreak: "Break {time}",
       toolWeek: "Week overview",
       toolDark: "Dark mode",
       target: "Target",
@@ -736,6 +989,10 @@
       dayShort_wednesday: "Mi",
       dayShort_thursday: "Do",
       dayShort_friday: "Fr",
+      dayShort_saturday: "Sa",
+      dayShort_sunday: "So",
+      saturday: "Samstag",
+      sunday: "Sonntag",
       breakRunning: "Pause seit {since} \u00b7 {current}",
       breakLeft: "noch {time} bis {n} Min. Pause",
       breakDone: "{n} Min. Pause erreicht",
@@ -743,7 +1000,123 @@
       whatIfAfter: "gehe",
       whatIfBalance: "Zeitsaldo dann {value}",
       autoSaved: "Gespeichert",
-      toolWhatIf: "Wenn ich um \u2026 gehe",
+      school: "Schule",
+      toolHistory: "Verlauf",
+      toolMore: "Mehr",
+      whatsNewTitle: "Neu in Version {version}",
+      whatsNewOk: "Alles klar",
+      syncSettings: "Einstellungen synchronisieren",
+      syncSettingsDesc: "Sollzeit, Schultage, Ziel und Planung \u00fcber dein Browser-Konto (Chrome-Sync).",
+      new_2_1_0_0: "Status-Block im Jazz-Look mit Fortschrittsbalken, Salden und Pausenzeiten",
+      new_2_1_0_1: "Menü «Mehr»: Planen, Woche, Verlauf mit Diagramm, Rekorde und Ziel-Saldo",
+      new_2_1_0_2: "Icon oben im Browser mit dem Prozent von heute, und Alt+J für die Stempelseite",
+      new_2_1_0_3: "Meldungen vor dem Feierabend und wenn die Pause vorbei ist",
+      new_2_1_0_4: "Deutsch / Englisch, Dunkelmodus, Schultage für Lernende",
+      new_2_1_0_5: "Automatische Sicherung jeden Monat und Einstellungen auf allen Browsern synchron",
+      toolHelp: "Hilfe",
+      helpTitle: "Was ist was",
+      help_status_term: "Status",
+      help_status_text: "Ein- oder ausgestempelt, gearbeitet, verbleibend (Minus = Überzeit) und wann du Feierabend hast.",
+      help_bar_term: "Balken",
+      help_bar_text: "Grün = Arbeit, blau = in Jazz eingetragene Absenz (z. B. Termin), orange = Überzeit. Darunter Pause und Überzeit.",
+      help_breaks_term: "Pausen",
+      help_breaks_text: "Eingestempelt: ab wann eine Pause sinnvoll ist und wann sie spätestens fällig ist. Ausgestempelt: die laufende Pause.",
+      help_clockout_term: "AUSSTEMPELN!!!",
+      help_clockout_text: "Erscheint in Rot, solange gerade eine Pausenregel verletzt wird.",
+      help_balances_term: "Salden",
+      help_balances_text: "Zeit- und Feriensaldo von unten auf der Jazz-Seite, dazu der Zeitsaldo inklusive heute.",
+      help_menu_term: "Mehr (•••)",
+      help_menu_text: "Planen (Wenn ich um … gehe, Mittagspause), Wochenübersicht, Verlauf mit Diagramm, Rekorde und Ziel-Saldo.",
+      help_top_term: "DE / EN und Mond",
+      help_top_text: "Sprache der Extension und der Jazz-Seite, und Dunkelmodus für die ganze Seite.",
+      help_icon_term: "Icon oben im Browser",
+      help_icon_text: "Ring mit dem Prozent von heute; mit der Maus darüber siehst du die Zeiten. Alt+J (Option+J) öffnet die Stempelseite.",
+      help_popup_term: "Popup",
+      help_popup_text: "Klick aufs Icon: Live-Status, Einstellungen (Sollzeit, Schultage, Benachrichtigungen) und Sicherung.",
+      toolRecords: "Rekorde",
+      recordsTitle: "Rekorde ({n} Tage)",
+      recordsTitleEmpty: "Rekorde erscheinen, sobald ein paar Arbeitstage bekannt sind",
+      recEarliest: "Fr\u00fchester Start",
+      recLongest: "L\u00e4ngster Tag",
+      recStreak: "Ohne Pausen-Verstoss",
+      recDay: "1 Tag",
+      recDays: "{n} Tage",
+      recBest: "Rekord {n}",
+      dayChartTitle: "Heute vs. normal",
+      rangeLabel: "Normal aus",
+      range_three: "3 Tage",
+      range_week: "Woche",
+      range_month: "Monat",
+      range_max: "Max",
+      dayToday: "Heute",
+      dayNormal: "Normal",
+      dayModel: "Typischer Tag",
+      dayAhead: "{value} voraus",
+      dayBehind: "{value} hinterher",
+      dayEven: "wie immer",
+      dayNormalNote: "Normal = Durchschnitt deiner letzten {n} Arbeitstage.",
+      dayModelNote: "Noch keine fr\u00fcheren Tage bekannt, darum nimmt die Normal-Linie 8:00 Start und 30 Min. Pause um 12:00 an.",
+      goalLine: "Ziel-Saldo: heute {value} \u00b7 bis {time}",
+      goalLineNoToday: "Ziel-Saldo: {value} pro Arbeitstag",
+      goalLineReached: "Ziel-Saldo erreicht",
+      goalOn: "Ziel-Saldo an, wird jeden Tag angezeigt",
+      goalOff: "Ziel-Saldo aus",
+      goalLineOver: "Das Datum deines Ziel-Saldos ist vorbei",
+      historyTitle: "Saldo-Verlauf",
+      historyChange: "seit {from}: {value}",
+      historyEmpty: "Die Aufzeichnung beginnt heute: Jeden Tag, an dem du die Stempelseite \u00f6ffnest, kommt ein Punkt dazu.",
+      historyFew: "Jeden Tag, an dem du die Stempelseite \u00f6ffnest, kommt ein Punkt dazu.",
+      backupTitle: "Daten sichern",
+      backupText: "Einstellungen, Planung und Saldo-Verlauf als Datei, z. B. f\u00fcr einen anderen Computer.",
+      backupExport: "Exportieren",
+      backupImport: "Importieren",
+      backupImported: "Importiert",
+      backupInvalid: "Das ist keine Sicherung vom Jazz Time Tracker.",
+      autoBackup: "Jeden Monat automatisch sichern",
+      autoBackupDesc: "Wird in Downloads \u2192 Jazz Time Tracker gespeichert.",
+      lastBackup: "Letzte Sicherung: {date}",
+      noBackupYet: "Noch keine Sicherung",
+      autoBackupDoneTitle: "Sicherung gespeichert",
+      autoBackupDoneBody: "Deine Jazz-Time-Tracker-Daten liegen in Downloads \u2192 Jazz Time Tracker.",
+      breakWindow: "Pause ideal ab {from}, sp\u00e4testens {to}",
+      breakWindowNow: "Pause sp\u00e4testens um {to}",
+      breakWindowTwo: "Heute sind zwei Pausen n\u00f6tig, die erste bis {to}",
+      breakWindowNone: "Heute keine weitere Pause n\u00f6tig",
+      schoolShort: "Schule",
+      schoolToday: "Heute ist Schultag",
+      schoolTodayNote: "Keine Arbeitszeit eingeplant. Wenn du doch stempelst, wird normal gerechnet.",
+      schoolToggle: "{day} ist ein Schultag",
+      schoolHint: "Schultage z\u00e4hlen nicht zur Wochensumme und nicht zum Ziel-Saldo.",
+      toolWhatIf: "Planen",
+      toolGoal: "Ziel-Saldo",
+      goalTitle: "Ziel-Saldo",
+      planTitle: "Planen",
+      lunchBefore: "Pause um",
+      lunchMiddle: "f\u00fcr",
+      lunchAfter: "Min.",
+      lunchResult: "Feierabend {time}",
+      lunchAtLabel: "Beginn der Pause",
+      lunchMinLabel: "Pausenl\u00e4nge in Minuten",
+      lunchNote: "Pause bis {end}",
+      lunchDone: "Pause heute schon gemacht",
+      lunchNoteTopped: "Pause bis {end}, auf die Mindestpause von {n} Min. ergänzt",
+      lunchOnlyClockedIn: "Funktioniert, solange du eingestempelt bist",
+      goalBefore: "Zeitsaldo",
+      goalMiddle: "bis",
+      goalLabel: "Ziel-Zeitsaldo",
+      goalDateLabel: "Zieldatum",
+      goalPerDay: "{value} pro Tag",
+      goalReached: "Ziel erreicht",
+      goalReachedNote: "Bei {days} Arbeitstagen k\u00f6nntest du sogar {value} pro Tag weniger arbeiten",
+      goalNote: "noch {days} Arbeitstage \u00b7 heute bis {time}",
+      goalNoteNoToday: "noch {days} Arbeitstage",
+      goalNoDays: "Bis zu diesem Datum gibt es keinen Arbeitstag mehr",
+      goalNoBalance: "Kein Zeitsaldo auf der Seite gefunden",
+      breakDoneTitle: "Pause vorbei",
+      breakDoneBody: "Deine {n} Minuten Pause sind um. Du kannst wieder einstempeln.",
+      tabToGo: "{time} bis Feierabend",
+      tabOvertime: "+{time} \u00dcberzeit",
+      tabBreak: "Pause {time}",
       toolWeek: "Wochen\u00fcbersicht",
       toolDark: "Dunkler Modus",
       target: "Soll",
@@ -853,6 +1226,17 @@
     runningBreak,
     leaveAtDifference,
     timeBalanceWithToday,
+    plannedGoHome,
+    goalPerDay,
+    isSchoolToday,
+    schoolDays,
+    breakWindow,
+    goalToday,
+    BACKUP_KEYS,
+    WHATS_NEW,
+    SETTING_KEYS,
+    readBackup,
+    describeGoalToday,
     badgeText,
     todayKey,
     resolveLanguage,

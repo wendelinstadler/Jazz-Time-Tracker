@@ -20,6 +20,12 @@
     </div>
   </header>
 
+  <section class="card whatsnew" id="whatsNew" hidden>
+    <div class="whatsnew-title" id="whatsNewTitle"></div>
+    <ul id="whatsNewList"></ul>
+    <button type="button" class="whatsnew-ok" id="whatsNewOk" data-i18n="whatsNewOk"></button>
+  </section>
+
   <!-- Live status -->
   <section class="card live" id="liveCard" aria-live="off">
     <div class="live-body" id="liveBody" hidden>
@@ -40,6 +46,8 @@
         </dl>
       </div>
     </div>
+    <div class="breakwin" id="liveBreakWin" hidden></div>
+    <div class="goalline" id="liveGoal" hidden></div>
     <div class="live-meta" id="liveMeta" hidden>
       <span><span data-i18n="breakTaken"></span> <strong id="liveBreak">–</strong></span>
       <span id="liveOverWrap"><span data-i18n="overtime"></span> <strong id="liveOver">0:00</strong></span>
@@ -51,8 +59,8 @@
       <div class="balance" id="balVacRow"><div class="balance-value" id="balVac"></div><div class="balance-label" data-i18n="vacationBalance"></div><div class="balance-label" id="balVacSub"></div></div>
     </div>
     <div class="live-empty" id="liveEmpty" hidden>
-      <strong data-i18n="noDataTitle"></strong>
-      <p data-i18n="noDataBody"></p>
+      <strong id="liveEmptyTitle"></strong>
+      <p id="liveEmptyBody"></p>
     </div>
   </section>
 
@@ -69,6 +77,16 @@
         <div class="row-desc" data-i18n="apprenticeDesc"></div>
       </div>
       <label class="switch"><input id="isApprentice" type="checkbox"/><span class="slider"></span></label>
+    </div>
+  </section>
+
+  <section class="card sync-card">
+    <div class="row">
+      <div class="row-text">
+        <label class="row-label" for="syncSettings" data-i18n="syncSettings"></label>
+        <div class="row-desc" data-i18n="syncSettingsDesc"></div>
+      </div>
+      <label class="switch"><input id="syncSettings" type="checkbox" checked/><span class="slider"></span></label>
     </div>
   </section>
 
@@ -109,9 +127,28 @@
   <h3 data-i18n="sectionHours"></h3>
   <section class="card">
     <div class="days" id="days"></div>
-    <div class="hint" data-i18n="hoursHint"></div>
+    <div class="hint"><span data-i18n="hoursHint"></span> <span class="school-hint" data-i18n="schoolHint"></span></div>
   </section>
 
+  <div class="spacer"></div>
+
+  <h3 data-i18n="backupTitle"></h3>
+  <section class="card backup">
+    <div class="row backup-auto">
+      <div class="row-text">
+        <label class="row-label" for="autoBackup" data-i18n="autoBackup"></label>
+        <div class="row-desc" data-i18n="autoBackupDesc"></div>
+      </div>
+      <label class="switch"><input id="autoBackup" type="checkbox" checked/><span class="slider"></span></label>
+    </div>
+    <p class="row-desc" data-i18n="backupText"></p>
+    <div class="links">
+      <button type="button" class="link-button" id="exportData" data-i18n="backupExport"></button>
+      <button type="button" class="link-button" id="importData" data-i18n="backupImport"></button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden/>
+    </div>
+    <p class="row-desc last-backup" id="lastBackup"></p>
+  </section>
   <div class="spacer"></div>
 
   <!-- Links and credits -->
